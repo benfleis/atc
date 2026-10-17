@@ -1,0 +1,233 @@
+#!/usr/bin/env -S python3 -I
+"""Work queue over the $TASKS TODO files (rules: config/agents/AGENTS.md, "Task notes").
+
+  tasks ready [-p N] [--all]     prioritised items that nobody holds and nothing blocks
+  tasks claim REF --as NAME      record a claim in atc/claims.log; refuses a ref held by another
+  tasks release REF --as NAME    give the claim back
+  tasks check                    report entries and refs that do not parse or resolve
+
+REF is `<topic>/<date>: <title>`, as in the entry heading; a unique prefix of the title is enough.
+"""
+
+import argparse
+import datetime
+import fcntl
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("TASKS_DIR", "/opt/workspace/state/tasks"))
+CLAIMS = ROOT / "atc" / "claims.log"
+
+HEADING = re.compile(r"^## (\d{4}-\d{2}(?:-\d{2})?|undated): (.+?)\s*$")
+PRIO = re.compile(r"^\*\*P(\d)\*\*")
+PRIO_ITEM = re.compile(r"^- (\d{4}-\d{2}(?:-\d{2})?|undated) (.+?)(?: -- |$)")
+STATUS = re.compile(r"^Status: (open|blocked-by|done|dropped)\b\s*(.*)$")
+REF = re.compile(r"^([\w.-]+)/(\d{4}-\d{2}(?:-\d{2})?|undated): (.+)$")
+
+
+class Entry:
+    def __init__(self, topic, date, title, line):
+        self.topic, self.date, self.title, self.line = topic, date, title, line
+        self.status, self.arg = None, ""
+
+    @property
+    def ref(self):
+        return f"{self.topic}/{self.date}: {self.title}"
+
+    def closed(self):
+        return self.status in ("done", "dropped")
+
+    def blockers(self):
+        return [r.strip() for r in self.arg.split(";") if r.strip()] if self.status == "blocked-by" else []
+
+
+def parse(path):
+    topic = path.parent.name
+    entries, prios = [], []
+    level, in_log, cur = None, False, None
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        line = raw.rstrip()
+        if line == "---":
+            in_log = True
+            continue
+        if not in_log:
+            if m := PRIO.match(line):
+                level = int(m[1])
+            elif line.startswith("**"):
+                level = None
+            elif level is not None and (m := PRIO_ITEM.match(line)):
+                prios.append((level, m[1], m[2], n))
+            continue
+        if m := HEADING.match(line):
+            cur = Entry(topic, m[1], m[2], n)
+            entries.append(cur)
+        elif cur and cur.status is None and line:
+            if m := STATUS.match(line):
+                cur.status, cur.arg = m[1], m[2]
+            cur.status = cur.status or "missing"
+    return entries, prios
+
+
+def load():
+    entries, prios = [], []
+    for path in sorted(ROOT.glob("*/TODO.md")):
+        e, p = parse(path)
+        entries += e
+        prios += [(path.parent.name, *x) for x in p]
+    return entries, prios
+
+
+def resolve(ref, entries):
+    m = REF.match(ref.strip())
+    if not m:
+        return None, f"not a ref: {ref!r}"
+    topic, date, title = m[1], m[2], m[3].lower()
+    hits = [e for e in entries if e.topic == topic and e.date == date and e.title.lower().startswith(title)]
+    exact = [e for e in hits if e.title.lower() == title]
+    hits = exact or hits
+    if len(hits) != 1:
+        return None, f"{len(hits)} entries match {ref!r}"
+    return hits[0], None
+
+
+STOP = {"the", "and", "for", "not", "with", "from", "into", "are", "has", "its", "all", "one"}
+
+
+def words(s):
+    return {w.rstrip("s") for w in re.findall(r"[a-z0-9_.#]+", s.lower()) if len(w) >= 3 and w not in STOP}
+
+
+def match_prio(topic, date, text, entries):
+    """Priority lines name entries loosely, so pick the same-dated entry sharing most words."""
+    cands = [e for e in entries if e.topic == topic and e.date == date]
+    scored = sorted(((len(words(text) & words(e.title)), e) for e in cands), key=lambda x: -x[0])
+    return scored[0][1] if scored and scored[0][0] > 0 else None
+
+
+def read_claims():
+    held = {}
+    if CLAIMS.exists():
+        for line in CLAIMS.read_text().splitlines():
+            parts = line.split(" ", 3)
+            if len(parts) == 4 and parts[2] in ("claim", "release"):
+                ts, agent, op, ref = parts
+                if op == "claim":
+                    held[ref] = (agent, ts)
+                else:
+                    held.pop(ref, None)
+    return held
+
+
+def state(e, entries, held):
+    if e.closed():
+        return e.status, ""
+    if e.ref in held:
+        agent, ts = held[e.ref]
+        return "claimed", f"by {agent} since {ts}"
+    open_blockers = []
+    for r in e.blockers():
+        b, _ = resolve(r, entries)
+        if b is None or not b.closed():
+            open_blockers.append(r)
+    if open_blockers:
+        return "blocked", "<- " + "; ".join(open_blockers)
+    return "ready", ""
+
+
+def cmd_ready(args):
+    entries, prios = load()
+    held = read_claims()
+    seen = set()
+    for topic, level, date, text, _ in sorted(prios, key=lambda p: (p[1], p[0])):
+        if level > args.p:
+            continue
+        e = match_prio(topic, date, text, entries)
+        if e and e.ref in seen:
+            continue
+        seen.add(e and e.ref)
+        if e is None:
+            if args.all:
+                print(f"P{level}  {topic:<10} {'?':<8} {date} {text}  (no matching entry)")
+            continue
+        st, why = state(e, entries, held)
+        if args.all or st == "ready":
+            print(f"P{level}  {topic:<10} {st:<8} {e.date}: {e.title}  {why}".rstrip())
+
+
+def agent_name(args):
+    name = args.as_ or os.environ.get("TASKS_AGENT")
+    if not name or " " in name:
+        sys.exit("tasks: give your agent name (no spaces) with --as or TASKS_AGENT")
+    return name
+
+
+def cmd_claim(args, op):
+    agent = agent_name(args)
+    entries, _ = load()
+    e, err = resolve(args.ref, entries)
+    if err:
+        sys.exit(f"tasks: {err}")
+    CLAIMS.parent.mkdir(exist_ok=True)
+    with open(CLAIMS, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        holder = read_claims().get(e.ref)
+        if op == "claim" and holder and holder[0] != agent:
+            sys.exit(f"tasks: held by {holder[0]} since {holder[1]}")
+        if op == "release" and (not holder or holder[0] != agent):
+            sys.exit(f"tasks: {agent} does not hold {e.ref}")
+        if op == "claim" and e.closed():
+            sys.exit(f"tasks: entry is {e.status}")
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        f.write(f"{ts} {agent} {op} {e.ref}\n")
+    print(f"{op} {e.ref}")
+
+
+def cmd_check(_):
+    entries, prios = load()
+    bad = 0
+
+    def report(msg):
+        nonlocal bad
+        bad += 1
+        print(msg)
+
+    for e in entries:
+        where = f"{e.topic}/TODO.md:{e.line}"
+        if e.status in (None, "missing"):
+            report(f"{where}: no `Status:` line under '{e.title}'")
+        for r in e.blockers():
+            if resolve(r, entries)[1]:
+                report(f"{where}: blocked-by does not resolve: {r}")
+    for topic, level, date, text, n in prios:
+        if match_prio(topic, date, text, entries) is None:
+            report(f"{topic}/TODO.md:{n}: P{level} item matches no entry: {date} {text}")
+    for ref in read_claims():
+        if resolve(ref, entries)[1]:
+            report(f"atc/claims.log: held ref no longer resolves: {ref}")
+    sys.exit(1 if bad else 0)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="tasks", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("ready")
+    r.add_argument("-p", type=int, default=1, help="lowest priority to show (default 1)")
+    r.add_argument("--all", action="store_true", help="also show claimed, blocked, closed and unmatched items")
+    for op in ("claim", "release"):
+        c = sub.add_parser(op)
+        c.add_argument("ref")
+        c.add_argument("--as", dest="as_")
+    sub.add_parser("check")
+    args = ap.parse_args()
+    if args.cmd == "ready":
+        cmd_ready(args)
+    elif args.cmd == "check":
+        cmd_check(args)
+    else:
+        cmd_claim(args, args.cmd)
+
+
+if __name__ == "__main__":
+    main()
