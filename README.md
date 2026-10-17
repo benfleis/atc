@@ -43,3 +43,21 @@ tasks check                       # after each edit to a TODO file
 ```
 
 See [SPEC.md](SPEC.md) for the rest.
+
+## Development
+
+Pre-commit hooks run ruff (lint and format), gitleaks (secrets) and basic file checks. Install
+pre-commit as a uv tool, then the git hook:
+
+```sh
+uv tool install pre-commit
+pre-commit install
+```
+
+The hook then runs on each commit. A tool install keeps its own Python, so the hook does not break
+when the uv cache is cleaned, as it can when pre-commit came from `uvx`. To run all hooks by
+hand, without an install:
+
+```sh
+uvx pre-commit run --all-files
+```
