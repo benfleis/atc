@@ -210,7 +210,9 @@ def cmd_check(_):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="tasks", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="tasks", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("ready")
     r.add_argument("-p", type=int, default=1, help="lowest priority to show (default 1)")
